@@ -64,8 +64,9 @@ class ConnectionManager:
 
     async def funasr_proxy(self, client_ws: WebSocket, client_id: int):
         """负责与内网 FunASR 服务端交互、重连与数据转发"""
-        
+        conn_attempt = 0
         while True:
+            conn_attempt += 1
             funasr_ws = None
             try:
                 logger.info(f"尝试连接 FunASR 服务: {FUNASR_WS_URL}")
@@ -90,13 +91,18 @@ class ConnectionManager:
                     logger.info(f"客户端 {client_id} 成功连接到 FunASR 服务 端点")
                     
                     # FunASR 模型版本常常需要在第一包发 json 格式的 init/config 参数
+                    # 注意：每次重连使用不同的 wav_name，防止 FunASR 服务端保留上一次的死连接状态而拒绝接收
                     init_msg = {
                         "mode": "2pass", 
                         "chunk_size": [5, 10, 5], 
-                        "wav_name": f"client_{client_id}", 
+                        "wav_name": f"client_{client_id}_{conn_attempt}", 
                         "is_speaking": True
                     }
                     await funasr_ws.send(json.dumps(init_msg))
+
+                    # 清理积压的旧音频数据，避免重连后瞬间发送大量排队数据导致 FunASR 服务端再次崩溃
+                    while not client_ws.audio_queue.empty():
+                        client_ws.audio_queue.get_nowait()
 
                     # 协程 1：把前端发来的 PCM 推送给 FunASR
                     async def sender():
@@ -135,6 +141,12 @@ class ConnectionManager:
                     
                     for task in pending:
                         task.cancel()
+                        
+                    # 【关键修复】显式调用完成的任务的 result()，让内部（例如连接断开）的异常能够上抛
+                    # 从而触发外部的 except Exception，执行 2秒休眠 和 正确的重连工作。
+                    # 否则异常会被静默吞噬，导致无限极速尝试重连并失败。
+                    for task in done:
+                        task.result()
 
             except asyncio.CancelledError:
                 if funasr_ws:
