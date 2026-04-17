@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>实时会议转录转写</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; line-height: 1.6; }
+        .controls button { padding: 10px 20px; font-size: 16px; margin-right: 10px; cursor: pointer; }
+        .status { margin-bottom: 20px; font-weight: bold; color: blue; }
+        #transcription { 
+            background: #f4f4f4; 
+            padding: 15px; 
+            border: 1px solid #ccc; 
+            min-height: 300px; 
+            max-height: 500px; 
+            overflow-y: auto; 
+            white-space: pre-wrap; 
+            font-size: 16px;
+        }
+        .partial { color: #888; }
+        .final { color: #000; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h2>实时会议转录测试系统</h2>
+    <div class="status" id="statusMessage">后端就绪中，请点击开始...</div>
+    <div class="controls">
+        <button id="startBtn">开始录音</button>
+        <button id="stopBtn" disabled>停止录音</button>
+    </div>
+    <div style="margin-top:20px;">
+        <p>实时转录结果：</p>
+        <div id="transcription"></div>
+    </div>
+
+    <script>
+        let ws;
+        let audioContext;
+        let mediaStream;
+        let processor;
+
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const statusMessage = document.getElementById('statusMessage');
+        const transcriptionDiv = document.getElementById('transcription');
+
+        let accumulatedText = "";
+        let currentPartialText = "";
+
+        // 下采样并转换为 16位 PCM (FunASR所需流格式)
+        function downsampleBuffer(buffer, sampleRate, outSampleRate) {
+            if (outSampleRate === sampleRate) return buffer;
+            const sampleRateRatio = sampleRate / outSampleRate;
+            const newLength = Math.round(buffer.length / sampleRateRatio);
+            const result = new Int16Array(newLength);
+            let offsetResult = 0;
+            let offsetBuffer = 0;
+            while (offsetResult < result.length) {
+                let nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+                let accum = 0, count = 0;
+                for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                    accum += buffer[i];
+                    count++;
+                }
+                const sample = accum / count;
+                // 将 float32 限制并转为 int16
+                const s = Math.max(-1, Math.min(1, sample));
+                result[offsetResult] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                offsetResult++;
+                offsetBuffer = nextOffsetBuffer;
+            }
+            return result;
+        }
+
+        function renderText() {
+            let html = "";
+            if (accumulatedText) {
+                html += `<span class="final">${accumulatedText}</span>`;
+            }
+            if (currentPartialText) {
+                html += `<br/><span class="partial">${currentPartialText}</span>`;
+            }
+            transcriptionDiv.innerHTML = html;
+            transcriptionDiv.scrollTop = transcriptionDiv.scrollHeight;
+        }
+
+        async function startRecording() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            } catch (err) {
+                alert("获取麦克风失败：" + err);
+                return;
+            }
+
+            statusMessage.innerText = "正在连接后端代理...";
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+
+            const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+            ws.onopen = () => {
+                statusMessage.innerText = "录音中，并已建立连接...";
+                accumulatedText = "";
+                currentPartialText = "";
+                renderText();
+                
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                // 使用 4096 作为采样缓存区间，平衡延迟和开销
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+
+                processor.onaudioprocess = (e) => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        // 数据降采样转为 16kHz 给 Python 后台
+                        const pcm16 = downsampleBuffer(inputData, audioContext.sampleRate, 16000);
+                        ws.send(pcm16.buffer);
+                    }
+                };
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const res = JSON.parse(event.data);
+                    const text = res.text || "";
+                    if (res.is_final) {
+                        accumulatedText += (accumulatedText ? "\\n" : "") + text;
+                        currentPartialText = "";
+                    } else {
+                        currentPartialText = text;
+                    }
+                    renderText();
+                } catch(e) {
+                    console.error("解析返回数据失败: ", e, event.data);
+                }
+            };
+
+            ws.onerror = (e) => {
+                console.error("WebSocket报错: ", e);
+                statusMessage.innerText = "后端连接异常断开！";
+                stopRecording();
+            };
+
+            ws.onclose = () => {
+                statusMessage.innerText = "转录连接已关闭。";
+                stopRecording();
+            };
+        }
+
+        function stopRecording() {
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            statusMessage.innerText = "已停止采集";
+            
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
+            }
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.close();
+            }
+        }
+
+        startBtn.addEventListener('click', startRecording);
+        stopBtn.addEventListener('click', stopRecording);
+    </script>
+</body>
+</html>
