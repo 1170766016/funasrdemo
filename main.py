@@ -37,11 +37,12 @@ class ConnectionManager:
     async def handle_client(self, client_ws: WebSocket):
         await client_ws.accept()
         client_id = id(client_ws)
-        logger.info(f"客户端 {client_id} 已连接")
+        self.active_connections[client_id] = client_ws
+        logger.info(f"客户端 {client_id} 已连接，当前在线人数: {len(self.active_connections)}")
         
-        # 初始化一个异步队列用于缓存前端发来的音频流。
-        # 这里提前初始化是为了防止后续建立连接等带来的并发竞争漏洞：避免刚连上时浏览器发来首包数据，而后台还未就绪导致丢包。
-        client_ws.audio_queue = asyncio.Queue()
+        # 初始化一个具备容量限制的异步队列用于缓存前端发来的音频流。
+        # 设置 maxsize 可防止在后端拥塞或网络变差时无限缓存而引发内存溢出 (OOM)
+        client_ws.audio_queue = asyncio.Queue(maxsize=50)
         
         # 启动后台代理任务处理与 FunASR 的通信
         funasr_ws_task = asyncio.create_task(self.funasr_proxy(client_ws, client_id))
@@ -51,7 +52,10 @@ class ConnectionManager:
                 # 接收来自前端浏览器的二进制音频数据流（按约定的 16kHz PCM）
                 data = await client_ws.receive_bytes()
                 if hasattr(client_ws, 'audio_queue'):
-                    await client_ws.audio_queue.put(data)
+                    try:
+                        client_ws.audio_queue.put_nowait(data)
+                    except asyncio.QueueFull:
+                        logger.warning(f"客户端 {client_id} 的缓存队列已满，丢弃该部分音频包（可能 FunASR 处理遇到瓶颈）")
                 
         except WebSocketDisconnect:
             logger.info(f"客户端 {client_id} 浏览器主动断开连接")
@@ -59,7 +63,9 @@ class ConnectionManager:
             logger.error(f"处理客户端 {client_id} 音频输入时发生异常: {e}")
         finally:
             funasr_ws_task.cancel()
-            logger.info(f"已清理客户端 {client_id} 的相关转录资源")
+            if client_id in self.active_connections:
+                del self.active_connections[client_id]
+            logger.info(f"已清理客户端 {client_id} 的相关转录资源，当前在线人数: {len(self.active_connections)}")
 
 
     async def funasr_proxy(self, client_ws: WebSocket, client_id: int):
@@ -84,19 +90,28 @@ class ConnectionManager:
                 async with websockets.connect(
                     FUNASR_WS_URL,
                     open_timeout=10,
-                    ping_interval=20,
-                    ping_timeout=20,
+                    # 【极度重要】FunASR 官方服务端（特别是基于 C++/Python 混编的后端）通常不响应标准的 WebSocket Ping/Pong。
+                    # 强行开启此功能会导致服务端过了 ping_timeout 时间后被判定为掉线从而强行断开连接（报 1011 internal error）。
+                    # 因此，对于 FunASR，必须将这两个参数设为 None 来禁用标准心跳探测。
+                    ping_interval=None,
+                    ping_timeout=None,
                     # extra_headers=extra_headers  # <- 将上面定义的 headers 传进这里
                 ) as funasr_ws:
                     logger.info(f"客户端 {client_id} 成功连接到 FunASR 服务 端点")
                     
                     # FunASR 模型版本常常需要在第一包发 json 格式的 init/config 参数
                     # 注意：每次重连使用不同的 wav_name，防止 FunASR 服务端保留上一次的死连接状态而拒绝接收
+                    # 严格按照 Fun-ASR-Nano-2512-Docker 文档要求补全所有核心握手参数
                     init_msg = {
                         "mode": "2pass", 
                         "chunk_size": [5, 10, 5], 
+                        "chunk_interval": 10,
+                        "encoder_chunk_look_back": 4, 
+                        "decoder_chunk_look_back": 1, 
+                        "audio_fs": 16000, 
                         "wav_name": f"client_{client_id}_{conn_attempt}", 
-                        "is_speaking": True
+                        "is_speaking": True,
+                        "itn": True
                     }
                     await funasr_ws.send(json.dumps(init_msg))
 
@@ -129,7 +144,11 @@ class ConnectionManager:
                                 logger.warning(f"未能解析 FunASR 返回结果 JSON: {response}")
                             
                             # 回传给网页前端
-                            await client_ws.send_text(response)
+                            try:
+                                await client_ws.send_text(response)
+                            except Exception as e:
+                                logger.warning(f"下发给客户端 {client_id} 时发生错误（可能客户端已断开）: {e}")
+                                raise
 
                     sender_task = asyncio.create_task(sender())
                     receiver_task = asyncio.create_task(receiver())
@@ -142,16 +161,28 @@ class ConnectionManager:
                     for task in pending:
                         task.cancel()
                         
-                    # 【关键修复】显式调用完成的任务的 result()，让内部（例如连接断开）的异常能够上抛
-                    # 从而触发外部的 except Exception，执行 2秒休眠 和 正确的重连工作。
-                    # 否则异常会被静默吞噬，导致无限极速尝试重连并失败。
+                    # 【增加异常屏蔽】等待这些 task 完全退出，防止后台抛出 "Task exception was never retrieved" 警告
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        
+                    # 【关键修复】必须处理所有已完成任务的异常，防止另一个任务抛出 "未检索到的异常"
+                    # 因为遇到网络错误时，sender 和 receiver 会同时抛出 ConnectionClosedError 并被同时放入 done 列表。
+                    # 如果只用无脑 for 循环，第一个 task.result() 抛出异常后中断循环，第二个 task 的异常就会泄漏。
+                    first_exception = None
                     for task in done:
-                        task.result()
+                        try:
+                            task.result()
+                        except Exception as e:
+                            if first_exception is None:
+                                first_exception = e
+                                
+                    if first_exception:
+                        raise first_exception
 
             except asyncio.CancelledError:
-                if funasr_ws:
-                    await funasr_ws.close()
-                break
+                # 依靠 async with websocket 的天然回收机制，无需手动 funasr_ws.close()
+                logger.debug(f"代理任务被主动取消 (客户端 {client_id})")
+                raise
             except Exception as e:
                 # 针对网络波动和服务断线处理：捕获异常，并使用 sleep 做退避重连机制
                 logger.error(f"客户端 {client_id} 与 FunASR 的连接出现异常或中断: {e}，2 秒后自动进行重新连接...")

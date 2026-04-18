@@ -48,29 +48,15 @@
         let accumulatedText = "";
         let currentPartialText = "";
 
-        // 下采样并转换为 16位 PCM (FunASR所需流格式)
-        function downsampleBuffer(buffer, sampleRate, outSampleRate) {
-            if (outSampleRate === sampleRate) return buffer;
-            const sampleRateRatio = sampleRate / outSampleRate;
-            const newLength = Math.round(buffer.length / sampleRateRatio);
-            const result = new Int16Array(newLength);
-            let offsetResult = 0;
-            let offsetBuffer = 0;
-            while (offsetResult < result.length) {
-                let nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
-                let accum = 0, count = 0;
-                for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
-                    accum += buffer[i];
-                    count++;
-                }
-                const sample = accum / count;
-                // 将 float32 限制并转为 int16
-                const s = Math.max(-1, Math.min(1, sample));
-                result[offsetResult] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-                offsetResult++;
-                offsetBuffer = nextOffsetBuffer;
+        // 将 float32 格式转换为 16位 PCM (FunASR所需流格式)
+        // 之前的手写粗糙下采样算法会引入极大的毛刺底噪，严重影响模型识别，现在我们将重采样交由底层引擎处理
+        function floatTo16BitPCM(input) {
+            const output = new Int16Array(input.length);
+            for (let i = 0; i < input.length; i++) {
+                const s = Math.max(-1, Math.min(1, input[i]));
+                output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
             }
-            return result;
+            return output;
         }
 
         function renderText() {
@@ -87,7 +73,16 @@
 
         async function startRecording() {
             try {
-                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                // 核心修复1：开启高级环境降噪、回声抑制和自动增益！底噪过大会导致 VAD 无法识别断句，从而一直出不来黑字（is_final）
+                mediaStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    } 
+                });
             } catch (err) {
                 alert("获取麦克风失败：" + err);
                 return;
@@ -106,7 +101,8 @@
                 currentPartialText = "";
                 renderText();
                 
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                // 核心修复2：强制开启底层原生 16000Hz 音频环境，这是当前最高保真的录制格式
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
                 const source = audioContext.createMediaStreamSource(mediaStream);
                 // 使用 4096 作为采样缓存区间，平衡延迟和开销
                 processor = audioContext.createScriptProcessor(4096, 1, 1);
@@ -117,8 +113,8 @@
                 processor.onaudioprocess = (e) => {
                     if (ws.readyState === WebSocket.OPEN) {
                         const inputData = e.inputBuffer.getChannelData(0);
-                        // 数据降采样转为 16kHz 给 Python 后台
-                        const pcm16 = downsampleBuffer(inputData, audioContext.sampleRate, 16000);
+                        // 数据已经通过麦克风原生理转为了高保真 16kHz 我们只需做类型转换发送即可
+                        const pcm16 = floatTo16BitPCM(inputData);
                         ws.send(pcm16.buffer);
                     }
                 };
@@ -129,7 +125,8 @@
                     const res = JSON.parse(event.data);
                     const text = res.text || "";
                     if (res.is_final) {
-                        accumulatedText += (accumulatedText ? "\\n" : "") + text;
+                        // 修正：将原先的 "\\n" 改为 "\n"（或者 "<br/>"），因为 innerHTML 加 pre-wrap 用 "\n" 即可换行
+                        accumulatedText += (accumulatedText ? "\n" : "") + text;
                         currentPartialText = "";
                     } else {
                         currentPartialText = text;
