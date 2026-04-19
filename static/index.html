@@ -132,8 +132,21 @@
 
                     // 兼容性判断：is_final 为 true 或者 mode 为 2pass-offline 都视为一句话结束
                     if (isFinal === true || isFinal === 1 || mode === "2pass-offline") {
-                        if (text.strip && text.strip() || text) {
-                            accumulatedText += (accumulatedText ? "\n" : "") + text.trim();
+                        if (text.trim()) {
+                            const trimmedText = text.trim();
+                            // --- 优化：处理句首标点 ---
+                            // 如果当前片段以标点开头，且历史记录不为空，则把标点贴在上一句末尾
+                            const isPunctuationFirst = /^[，。？！,.?!]/.test(trimmedText);
+                            
+                            if (isPunctuationFirst && accumulatedText) {
+                                const firstChar = trimmedText.charAt(0);
+                                const restText = trimmedText.substring(1).trim();
+                                accumulatedText += firstChar + (restText ? "\n" : "") + restText;
+                            } else {
+                                accumulatedText += (accumulatedText ? "\n" : "") + trimmedText;
+                            }
+                            // -------------------------
+
                             currentPartialText = "";
                             console.log("--- 触发结算 ---");
                         }
