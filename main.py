@@ -21,7 +21,7 @@ os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # FunASR的WebSocket内网地址，可通过环境变量覆盖
-FUNASR_WS_URL = os.getenv("FUNASR_WS_URL", "ws://127.0.0.1:10095")
+FUNASR_WS_URL = os.getenv("FUNASR_WS_URL", "ws://192.168.16.105:10095")
 
 @app.get("/")
 async def get():
@@ -111,7 +111,8 @@ class ConnectionManager:
                         "audio_fs": 16000, 
                         "wav_name": f"client_{client_id}_{conn_attempt}", 
                         "is_speaking": True,
-                        "itn": True
+                        "itn": True,
+                        "hotword": "" # 明确传空，防止部分版本默认行为不一
                     }
                     await funasr_ws.send(json.dumps(init_msg))
 
@@ -134,10 +135,15 @@ class ConnectionManager:
                                 res_data = json.loads(response)
                                 text = res_data.get('text', '')
                                 is_final = res_data.get('is_final', False)
-                                mode_text = "【最终】" if is_final else "【实时】"
+                                mode = res_data.get('mode', '')
+                                
+                                # 2pass 模式下，mode 等于 2pass-offline 通常是代表这一句话说完了（结算）
+                                is_sentence_end = is_final or mode == "2pass-offline"
+                                mode_text = "【最终】" if is_sentence_end else "【实时】"
+                                
                                 if text.strip():
-                                    if is_final:
-                                        logger.info(f"转录完成 (客户端 {client_id}): {text}")
+                                    if is_sentence_end:
+                                        logger.info(f">>> {mode_text} (客户端 {client_id}): {text}")
                                     else:
                                         logger.debug(f"{mode_text} {text}")
                             except json.JSONDecodeError:

@@ -123,11 +123,20 @@
             ws.onmessage = (event) => {
                 try {
                     const res = JSON.parse(event.data);
+                    // 【调试日志】如果依然有问题，请在浏览器 F12 Console 查看下面这行日志打印的 JSON 结构
+                    console.log("[ASR Result]", res);
+
                     const text = res.text || "";
-                    if (res.is_final) {
-                        // 修正：将原先的 "\\n" 改为 "\n"（或者 "<br/>"），因为 innerHTML 加 pre-wrap 用 "\n" 即可换行
-                        accumulatedText += (accumulatedText ? "\n" : "") + text;
-                        currentPartialText = "";
+                    const isFinal = res.is_final;
+                    const mode = res.mode;
+
+                    // 兼容性判断：is_final 为 true 或者 mode 为 2pass-offline 都视为一句话结束
+                    if (isFinal === true || isFinal === 1 || mode === "2pass-offline") {
+                        if (text.strip && text.strip() || text) {
+                            accumulatedText += (accumulatedText ? "\n" : "") + text.trim();
+                            currentPartialText = "";
+                            console.log("--- 触发结算 ---");
+                        }
                     } else {
                         currentPartialText = text;
                     }
