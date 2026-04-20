@@ -104,8 +104,9 @@
                 // 核心修复2：强制开启底层原生 16000Hz 音频环境，这是当前最高保真的录制格式
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
                 const source = audioContext.createMediaStreamSource(mediaStream);
-                // 使用 4096 作为采样缓存区间，平衡延迟和开销
-                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                // 使用 8192 作为采样缓存区间（约 512ms @16kHz），降低发包频率来减轻后端压力
+                // 相比 4096 减少了一半的 WebSocket 发包量，代价是约增加 256ms 延迟（实时转录场景可接受）
+                processor = audioContext.createScriptProcessor(8192, 1, 1);
                 
                 source.connect(processor);
                 processor.connect(audioContext.destination);
