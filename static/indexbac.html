@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>实时会议转录转写</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; line-height: 1.6; }
+        .controls button { padding: 10px 20px; font-size: 16px; margin-right: 10px; cursor: pointer; }
+        .status { margin-bottom: 20px; font-weight: bold; color: blue; }
+        #transcription {
+            background: #f4f4f4;
+            padding: 15px;
+            border: 1px solid #ccc;
+            min-height: 300px;
+            max-height: 500px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            font-size: 16px;
+        }
+        .partial { color: #888; }
+        .final { color: #000; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<h2>实时会议转录测试系统</h2>
+<div class="status" id="statusMessage">后端就绪中，请点击开始...</div>
+<div class="controls">
+    <button id="startBtn">开始录音</button>
+    <button id="stopBtn" disabled>停止录音</button>
+</div>
+<div style="margin-top:20px;">
+    <p>实时转录结果：</p>
+    <div id="transcription"></div>
+</div>
+
+<script>
+let ws, audioContext, mediaStream, workletNode;
+
+const startBtn        = document.getElementById('startBtn');
+const stopBtn         = document.getElementById('stopBtn');
+const statusMessage   = document.getElementById('statusMessage');
+const transcriptionDiv = document.getElementById('transcription');
+
+let accumulatedText    = "";
+let currentPartialText = "";
+
+/* ============================================================
+   AudioWorklet 处理器代码（独立音频线程，不丢帧）
+   - 以系统原生采样率（48000/44100）采集，线性插值下采样到 16kHz
+   - 每积累 8192 个 16kHz 采样（约 512ms）发一个包
+   ============================================================ */
+const workletCode = `
+class PCMProcessor extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this.targetRate = 16000;
+        this.buffer     = [];
+        this.chunkSize  = 8192;
+    }
+    process(inputs) {
+        const input = inputs[0];
+        if (!input || !input[0]) return true;
+        const channel = input[0];
+        const ratio   = sampleRate / this.targetRate;
+        const outLen  = Math.floor(channel.length / ratio);
+
+        for (let i = 0; i < outLen; i++) {
+            const idx  = i * ratio;
+            const i0   = Math.floor(idx);
+            const i1   = Math.min(i0 + 1, channel.length - 1);
+            const frac = idx - i0;
+            this.buffer.push(channel[i0] * (1 - frac) + channel[i1] * frac);
+        }
+
+        while (this.buffer.length >= this.chunkSize) {
+            const chunk = this.buffer.splice(0, this.chunkSize);
+            const pcm16 = new Int16Array(chunk.length);
+            for (let i = 0; i < chunk.length; i++) {
+                const s = Math.max(-1, Math.min(1, chunk[i]));
+                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
+        }
+        return true;
+    }
+}
+registerProcessor("pcm-processor", PCMProcessor);
+`;
+
+/* ============================================================
+   渲染转录文字
+   ============================================================ */
+function renderText() {
+    let html = "";
+    if (accumulatedText) {
+        // 换行转 <br>，并转义 HTML 特殊字符防止 XSS
+        const escaped = accumulatedText
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/\n/g, "<br>");
+        html += `<span class="final">${escaped}</span>`;
+    }
+    if (currentPartialText) {
+        const escaped = currentPartialText
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+        html += `<br/><span class="partial">${escaped}</span>`;
+    }
+    transcriptionDiv.innerHTML = html;
+    transcriptionDiv.scrollTop = transcriptionDiv.scrollHeight;
+}
+
+/* ============================================================
+   开始录音
+   ============================================================ */
+async function startRecording() {
+    try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                channelCount:     1,
+                echoCancellation: false,  // 关闭：避免误裁人声（会议场景）
+                autoGainControl:  false,  // 关闭：避免放大底噪干扰 VAD 断句
+                noiseSuppression: true    // 保留：抑制稳态底噪（空调、风扇）
+            }
+        });
+    } catch (err) {
+        alert("获取麦克风失败：" + err);
+        return;
+    }
+
+    statusMessage.innerText = "正在连接后端代理...";
+    startBtn.disabled = true;
+    stopBtn.disabled  = false;
+
+    // ★ 关键修复：用 window.location.host 自动拼出正确地址
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = async () => {
+        statusMessage.innerText = "录音中，并已建立连接...";
+        accumulatedText    = "";
+        currentPartialText = "";
+        renderText();
+
+        // 用系统原生采样率建立 AudioContext（高保真），由 Worklet 负责下采样到 16kHz
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        console.log("[ASR] AudioContext 采样率:", audioContext.sampleRate);
+
+        // 动态加载 Worklet 模块
+        const blob = new Blob([workletCode], { type: "application/javascript" });
+        const url  = URL.createObjectURL(blob);
+        await audioContext.audioWorklet.addModule(url);
+        URL.revokeObjectURL(url);
+
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        workletNode  = new AudioWorkletNode(audioContext, "pcm-processor");
+
+        workletNode.port.onmessage = e => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(e.data);
+            }
+        };
+
+        // 只连 workletNode，不连 destination，彻底避免回声
+        source.connect(workletNode);
+    };
+
+    ws.onmessage = (event) => {
+        try {
+            const res  = JSON.parse(event.data);
+            console.log("[ASR Result]", res);
+
+            const text    = res.text || "";
+            const isFinal = res.is_final;
+            const mode    = res.mode;
+
+            if (isFinal === true || isFinal === 1 || mode === "2pass-offline") {
+                if (text.trim()) {
+                    const trimmedText = text.trim();
+
+                    // 句首标点贴到上一句末尾，避免孤立标点换行
+                    const isPuncFirst = /^[，。？！,.?!]/.test(trimmedText);
+                    if (isPuncFirst && accumulatedText) {
+                        const firstChar = trimmedText.charAt(0);
+                        const restText  = trimmedText.substring(1).trim();
+                        accumulatedText += firstChar + (restText ? "\n" : "") + restText;
+                    } else {
+                        accumulatedText += (accumulatedText ? "\n" : "") + trimmedText;
+                    }
+
+                    currentPartialText = "";
+                    console.log("[ASR] --- 触发结算 ---");
+                }
+            } else {
+                currentPartialText = text;
+            }
+            renderText();
+        } catch (e) {
+            console.error("[ASR] 解析返回数据失败:", e, event.data);
+        }
+    };
+
+    ws.onerror = (e) => {
+        console.error("[ASR] WebSocket 报错:", e);
+        statusMessage.innerText = "后端连接异常断开！";
+        stopRecording();
+    };
+
+    ws.onclose = () => {
+        statusMessage.innerText = "转录连接已关闭。";
+        stopRecording();
+    };
+}
+
+/* ============================================================
+   停止录音
+   ============================================================ */
+function stopRecording() {
+    startBtn.disabled = false;
+    stopBtn.disabled  = true;
+    statusMessage.innerText = "已停止采集";
+
+    // 先通知后端结算最后一句，再关闭连接，防止最后一句丢失
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+            ws.send(JSON.stringify({ is_speaking: false, _client_end: true }));
+        } catch (e) {}
+        setTimeout(() => { try { ws.close(); } catch (e) {} }, 600);
+    }
+
+    if (workletNode)  { workletNode.disconnect(); workletNode  = null; }
+    if (audioContext) { audioContext.close();      audioContext = null; }
+    if (mediaStream)  { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+}
+
+startBtn.addEventListener('click', startRecording);
+stopBtn.addEventListener('click', stopRecording);
+</script>
+
+</body>
+</html>

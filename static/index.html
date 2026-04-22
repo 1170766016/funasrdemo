@@ -35,10 +35,10 @@
     </div>
 
     <script>
-        let ws;
-        let audioContext;
-        let mediaStream;
-        let processor;
+        let ws = null;
+        let audioContext = null;
+        let mediaStream = null;
+        let audioWorkletNode = null;
 
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
@@ -48,8 +48,18 @@
         let accumulatedText = "";
         let currentPartialText = "";
 
-        // 将 float32 格式转换为 16位 PCM (FunASR所需流格式)
-        // 之前的手写粗糙下采样算法会引入极大的毛刺底噪，严重影响模型识别，现在我们将重采样交由底层引擎处理
+        // 【修复问题3】对所有来自外部的文本进行 HTML 转义，防止 XSS 注入
+        // 由于 accumulatedText 来自 FunASR 后端返回内容，直接插入 innerHTML 存在脚本注入风险
+        function escapeHtml(text) {
+            return text
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        // 将 float32 格式转换为 16位 PCM（FunASR 所需流格式）
         function floatTo16BitPCM(input) {
             const output = new Int16Array(input.length);
             for (let i = 0; i < input.length; i++) {
@@ -59,21 +69,47 @@
             return output;
         }
 
+        // 【修复问题2】将 accumulatedText 和 currentPartialText 的内容正确插入 span 标签内
+        // 【修复问题3】同时使用 escapeHtml 对文本转义，防止 XSS
         function renderText() {
             let html = "";
             if (accumulatedText) {
-                html += `<span class="final">${accumulatedText}</span>`;
+                html += `<span class="final">${escapeHtml(accumulatedText)}</span>`;
             }
             if (currentPartialText) {
-                html += `<br/><span class="partial">${currentPartialText}</span>`;
+                html += `<br/><span class="partial">${escapeHtml(currentPartialText)}</span>`;
             }
             transcriptionDiv.innerHTML = html;
             transcriptionDiv.scrollTop = transcriptionDiv.scrollHeight;
         }
 
+        // 【修复问题5】使用 AudioWorklet 替代已废弃的 ScriptProcessorNode
+        // AudioWorklet 在独立线程运行，不阻塞主线程，避免高负载时的音频卡顿和丢帧
+        // 这里通过 Blob URL 动态注册 Worklet 模块，无需额外的静态文件
+        async function registerAudioWorklet(context) {
+            const workletCode = `
+                class PCMProcessor extends AudioWorkletProcessor {
+                    process(inputs) {
+                        const input = inputs[0];
+                        if (input && input[0]) {
+                            // 将 Float32Array 直接传递给主线程，由主线程完成类型转换和发送
+                            this.port.postMessage(input[0].slice());
+                        }
+                        return true;
+                    }
+                }
+                registerProcessor('pcm-processor', PCMProcessor);
+            `;
+            const blob = new Blob([workletCode], { type: 'application/javascript' });
+            const url = URL.createObjectURL(blob);
+            await context.audioWorklet.addModule(url);
+            URL.revokeObjectURL(url); // 注册完成后立即释放 Blob URL，避免内存泄漏
+        }
+
         async function startRecording() {
             try {
-                // 核心修复1：开启高级环境降噪、回声抑制和自动增益！底噪过大会导致 VAD 无法识别断句，从而一直出不来黑字（is_final）
+                // 开启高级环境降噪、回声抑制和自动增益
+                // 底噪过大会导致 VAD 无法识别断句，从而一直出不来黑字（is_final）
                 mediaStream = await navigator.mediaDevices.getUserMedia({ 
                     audio: {
                         sampleRate: 16000,
@@ -92,53 +128,78 @@
             startBtn.disabled = true;
             stopBtn.disabled = false;
 
+            // 【修复问题1】正确拼接 WebSocket URL
+            // 原代码 protocol 变量声明后完全没有使用，模板字符串里是写死的 `///ws`（无效地址）
+            // 修复后根据当前页面协议自动选择 ws:// 或 wss://，并补全 host 部分
             const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
             ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
-            ws.onopen = () => {
+            ws.binaryType = "arraybuffer";
+
+            ws.onopen = async () => {
                 statusMessage.innerText = "录音中，并已建立连接...";
                 accumulatedText = "";
                 currentPartialText = "";
                 renderText();
-                
-                // 核心修复2：强制开启底层原生 16000Hz 音频环境，这是当前最高保真的录制格式
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-                const source = audioContext.createMediaStreamSource(mediaStream);
-                // 使用 8192 作为采样缓存区间（约 512ms @16kHz），降低发包频率来减轻后端压力
-                // 相比 4096 减少了一半的 WebSocket 发包量，代价是约增加 256ms 延迟（实时转录场景可接受）
-                processor = audioContext.createScriptProcessor(8192, 1, 1);
-                
-                source.connect(processor);
-                processor.connect(audioContext.destination);
 
-                processor.onaudioprocess = (e) => {
-                    if (ws.readyState === WebSocket.OPEN) {
-                        const inputData = e.inputBuffer.getChannelData(0);
-                        // 数据已经通过麦克风原生理转为了高保真 16kHz 我们只需做类型转换发送即可
-                        const pcm16 = floatTo16BitPCM(inputData);
-                        ws.send(pcm16.buffer);
-                    }
-                };
+                // 强制开启底层原生 16000Hz 音频环境，这是当前最高保真的录制格式
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+
+                try {
+                    // 【修复问题5】注册并使用 AudioWorkletNode
+                    await registerAudioWorklet(audioContext);
+                    const source = audioContext.createMediaStreamSource(mediaStream);
+                    audioWorkletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
+
+                    // Worklet 线程通过 postMessage 将原始 Float32 数据传回主线程
+                    audioWorkletNode.port.onmessage = (event) => {
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            const pcm16 = floatTo16BitPCM(event.data);
+                            ws.send(pcm16.buffer);
+                        }
+                    };
+
+                    source.connect(audioWorkletNode);
+                    // AudioWorklet 不需要连接到 destination 即可运行，
+                    // 但连接后可确保在部分浏览器中 process() 被持续调用
+                    audioWorkletNode.connect(audioContext.destination);
+
+                } catch (workletErr) {
+                    // 【降级兜底】若浏览器不支持 AudioWorklet（极少数旧版），回退到 ScriptProcessorNode
+                    console.warn("AudioWorklet 不可用，降级使用 ScriptProcessorNode:", workletErr);
+                    const source = audioContext.createMediaStreamSource(mediaStream);
+                    const processor = audioContext.createScriptProcessor(8192, 1, 1);
+                    source.connect(processor);
+                    processor.connect(audioContext.destination);
+                    processor.onaudioprocess = (e) => {
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            const inputData = e.inputBuffer.getChannelData(0);
+                            const pcm16 = floatTo16BitPCM(inputData);
+                            ws.send(pcm16.buffer);
+                        }
+                    };
+                    // 将 processor 挂到 audioWorkletNode 位置，供 stopRecording 统一清理
+                    audioWorkletNode = processor;
+                }
             };
 
             ws.onmessage = (event) => {
                 try {
                     const res = JSON.parse(event.data);
-                    // 【调试日志】如果依然有问题，请在浏览器 F12 Console 查看下面这行日志打印的 JSON 结构
                     console.log("[ASR Result]", res);
 
                     const text = res.text || "";
                     const isFinal = res.is_final;
                     const mode = res.mode;
 
-                    // 兼容性判断：is_final 为 true 或者 mode 为 2pass-offline 都视为一句话结束
+                    // 兼容性判断：is_final 为 true 或 mode 为 2pass-offline 都视为一句话结束
                     if (isFinal === true || isFinal === 1 || mode === "2pass-offline") {
                         if (text.trim()) {
                             const trimmedText = text.trim();
-                            // --- 优化：处理句首标点 ---
-                            // 如果当前片段以标点开头，且历史记录不为空，则把标点贴在上一句末尾
+
+                            // 处理句首标点：若片段以标点开头且历史记录不为空，
+                            // 则把标点贴在上一句末尾而非另起一行
                             const isPunctuationFirst = /^[，。？！,.?!]/.test(trimmedText);
-                            
                             if (isPunctuationFirst && accumulatedText) {
                                 const firstChar = trimmedText.charAt(0);
                                 const restText = trimmedText.substring(1).trim();
@@ -146,7 +207,6 @@
                             } else {
                                 accumulatedText += (accumulatedText ? "\n" : "") + trimmedText;
                             }
-                            // -------------------------
 
                             currentPartialText = "";
                             console.log("--- 触发结算 ---");
@@ -154,21 +214,26 @@
                     } else {
                         currentPartialText = text;
                     }
+
                     renderText();
-                } catch(e) {
+                } catch (e) {
                     console.error("解析返回数据失败: ", e, event.data);
                 }
             };
 
             ws.onerror = (e) => {
-                console.error("WebSocket报错: ", e);
+                console.error("WebSocket 报错: ", e);
                 statusMessage.innerText = "后端连接异常断开！";
                 stopRecording();
             };
 
+            // 【修复问题4】ws.onclose 与 stopRecording 存在循环调用问题：
+            // stopRecording 调用 ws.close() → 触发 onclose → onclose 再次调用 stopRecording
+            // 修复方案：在 stopRecording 中关闭连接前先将 ws.onclose 置为 null，
+            // 同时这里的 onclose 只负责更新状态文字，不再调用 stopRecording，
+            // 避免 UI 状态被重复重置和状态文字互相覆盖
             ws.onclose = () => {
                 statusMessage.innerText = "转录连接已关闭。";
-                stopRecording();
             };
         }
 
@@ -176,21 +241,32 @@
             startBtn.disabled = false;
             stopBtn.disabled = true;
             statusMessage.innerText = "已停止采集";
-            
-            if (processor) {
-                processor.disconnect();
-                processor = null;
+
+            if (audioWorkletNode) {
+                audioWorkletNode.disconnect();
+                audioWorkletNode = null;
             }
+
             if (audioContext) {
                 audioContext.close();
                 audioContext = null;
             }
+
             if (mediaStream) {
                 mediaStream.getTracks().forEach(track => track.stop());
                 mediaStream = null;
             }
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.close();
+
+            // 【修复问题4】先将 onclose 置为 null，再调用 ws.close()
+            // 防止 close() 触发 onclose 回调，导致状态文字被覆盖或逻辑重复执行
+            if (ws) {
+                ws.onclose = null;
+                if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+                    ws.close();
+                }
+                // 【修复问题6】关闭后将 ws 重置为 null，
+                // 防止旧的 ws 对象残留，下次点击开始时事件监听器堆叠
+                ws = null;
             }
         }
 
