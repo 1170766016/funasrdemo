@@ -208,11 +208,13 @@
                                 accumulatedText += (accumulatedText ? "\n" : "") + trimmedText;
                             }
 
-                            currentPartialText = "";
                             console.log("--- 触发结算 ---");
                         }
+                        // 无论是否有文本，结算时都清空实时结果
+                        currentPartialText = "";
                     } else {
-                        currentPartialText = text;
+                        // 实时结果(2pass-online)是增量的，需要累加
+                        currentPartialText += text;
                     }
 
                     renderText();
